@@ -1,167 +1,257 @@
-// SPDX-FileCopyrightText: Copyright 2019 yuzu Emulator Project
-// SPDX-License-Identifier: GPL-2.0-or-later
+// Copyright 2019 yuzu Emulator Project
+// Licensed under GPLv2 or any later version
+// Refer to the license.txt file included.
 
+#include <memory>
 #include <mutex>
-#include "common/assert.h"
-#include "common/debug.h"
-#include "imgui/renderer/texture_manager.h"
-#include "video_core/renderer_vulkan/vk_instance.h"
+#include <optional>
+#include <thread>
+#include <utility>
+
+#include "common/microprofile.h"
+#include "common/thread.h"
+#include "video_core/renderer_vulkan/vk_command_pool.h"
+#include "video_core/renderer_vulkan/vk_device.h"
+#include "video_core/renderer_vulkan/vk_master_semaphore.h"
+#include "video_core/renderer_vulkan/vk_query_cache.h"
 #include "video_core/renderer_vulkan/vk_scheduler.h"
+#include "video_core/renderer_vulkan/vk_state_tracker.h"
+#include "video_core/renderer_vulkan/wrapper.h"
 
 namespace Vulkan {
 
-std::mutex Scheduler::submit_mutex;
+MICROPROFILE_DECLARE(Vulkan_WaitForWorker);
 
-Scheduler::Scheduler(const Instance& instance)
-    : instance{instance}, master_semaphore{instance}, command_pool{instance, &master_semaphore} {
-#if TRACY_GPU_ENABLED
-    profiler_scope = reinterpret_cast<tracy::VkCtxScope*>(std::malloc(sizeof(tracy::VkCtxScope)));
-#endif
-    AllocateWorkerCommandBuffers();
+void VKScheduler::CommandChunk::ExecuteAll(vk::CommandBuffer cmdbuf) {
+    auto command = first;
+    while (command != nullptr) {
+        auto next = command->GetNext();
+        command->Execute(cmdbuf);
+        command->~Command();
+        command = next;
+    }
+
+    command_offset = 0;
+    first = nullptr;
+    last = nullptr;
 }
 
-Scheduler::~Scheduler() {
-#if TRACY_GPU_ENABLED
-    std::free(profiler_scope);
-#endif
+VKScheduler::VKScheduler(const VKDevice& device_, StateTracker& state_tracker_)
+    : device{device_}, state_tracker{state_tracker_},
+      master_semaphore{std::make_unique<MasterSemaphore>(device)},
+      command_pool{std::make_unique<CommandPool>(*master_semaphore, device)} {
+    AcquireNewChunk();
+    AllocateNewContext();
+    worker_thread = std::thread(&VKScheduler::WorkerThread, this);
 }
 
-void Scheduler::BeginRendering(const RenderState& new_state) {
-    if (is_rendering && render_state == new_state) {
+VKScheduler::~VKScheduler() {
+    quit = true;
+    cv.notify_all();
+    worker_thread.join();
+}
+
+u64 VKScheduler::CurrentTick() const noexcept {
+    return master_semaphore->CurrentTick();
+}
+
+bool VKScheduler::IsFree(u64 tick) const noexcept {
+    return master_semaphore->IsFree(tick);
+}
+
+void VKScheduler::Wait(u64 tick) {
+    master_semaphore->Wait(tick);
+}
+
+void VKScheduler::Flush(VkSemaphore semaphore) {
+    SubmitExecution(semaphore);
+    AllocateNewContext();
+}
+
+void VKScheduler::Finish(VkSemaphore semaphore) {
+    const u64 presubmit_tick = CurrentTick();
+    SubmitExecution(semaphore);
+    Wait(presubmit_tick);
+    AllocateNewContext();
+}
+
+void VKScheduler::WaitWorker() {
+    MICROPROFILE_SCOPE(Vulkan_WaitForWorker);
+    DispatchWork();
+
+    bool finished = false;
+    do {
+        cv.notify_all();
+        std::unique_lock lock{mutex};
+        finished = chunk_queue.Empty();
+    } while (!finished);
+}
+
+void VKScheduler::DispatchWork() {
+    if (chunk->Empty()) {
         return;
     }
-    EndRendering();
-    is_rendering = true;
-    render_state = new_state;
+    chunk_queue.Push(std::move(chunk));
+    cv.notify_all();
+    AcquireNewChunk();
+}
 
-    const auto width =
-        render_state.width != std::numeric_limits<u32>::max() ? render_state.width : 1;
-    const auto height =
-        render_state.height != std::numeric_limits<u32>::max() ? render_state.height : 1;
+void VKScheduler::RequestRenderpass(VkRenderPass renderpass, VkFramebuffer framebuffer,
+                                    VkExtent2D render_area) {
+    if (renderpass == state.renderpass && framebuffer == state.framebuffer &&
+        render_area.width == state.render_area.width &&
+        render_area.height == state.render_area.height) {
+        return;
+    }
+    const bool end_renderpass = state.renderpass != nullptr;
+    state.renderpass = renderpass;
+    state.framebuffer = framebuffer;
+    state.render_area = render_area;
 
-    const vk::RenderingInfo rendering_info = {
+    const VkRenderPassBeginInfo renderpass_bi{
+        .sType = VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO,
+        .pNext = nullptr,
+        .renderPass = renderpass,
+        .framebuffer = framebuffer,
         .renderArea =
             {
-                .offset = {0, 0},
-                .extent = {width, height},
+                .offset = {.x = 0, .y = 0},
+                .extent = render_area,
             },
-        .layerCount = 1,
-        .colorAttachmentCount = render_state.num_color_attachments,
-        .pColorAttachments = render_state.num_color_attachments > 0
-                                 ? render_state.color_attachments.data()
-                                 : nullptr,
-        .pDepthAttachment = render_state.has_depth ? &render_state.depth_attachment : nullptr,
-        .pStencilAttachment = render_state.has_stencil ? &render_state.stencil_attachment : nullptr,
+        .clearValueCount = 0,
+        .pClearValues = nullptr,
     };
 
-    current_cmdbuf.beginRendering(rendering_info);
+    Record([renderpass_bi, end_renderpass](vk::CommandBuffer cmdbuf) {
+        if (end_renderpass) {
+            cmdbuf.EndRenderPass();
+        }
+        cmdbuf.BeginRenderPass(renderpass_bi, VK_SUBPASS_CONTENTS_INLINE);
+    });
 }
 
-void Scheduler::EndRendering() {
-    if (!is_rendering) {
+void VKScheduler::RequestOutsideRenderPassOperationContext() {
+    EndRenderPass();
+}
+
+void VKScheduler::BindGraphicsPipeline(VkPipeline pipeline) {
+    if (state.graphics_pipeline == pipeline) {
         return;
     }
-    is_rendering = false;
-    current_cmdbuf.endRendering();
+    state.graphics_pipeline = pipeline;
+    Record([pipeline](vk::CommandBuffer cmdbuf) {
+        cmdbuf.BindPipeline(VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline);
+    });
 }
 
-void Scheduler::Flush(SubmitInfo& info) {
-    // When flushing, we only send data to the driver; no waiting is necessary.
-    SubmitExecution(info);
+void VKScheduler::WorkerThread() {
+    Common::SetCurrentThreadPriority(Common::ThreadPriority::High);
+    std::unique_lock lock{mutex};
+    do {
+        cv.wait(lock, [this] { return !chunk_queue.Empty() || quit; });
+        if (quit) {
+            continue;
+        }
+        auto extracted_chunk = std::move(chunk_queue.Front());
+        chunk_queue.Pop();
+        extracted_chunk->ExecuteAll(current_cmdbuf);
+        chunk_reserve.Push(std::move(extracted_chunk));
+    } while (!quit);
 }
 
-void Scheduler::Finish() {
-    // When finishing, we need to wait for the submission to have executed on the device.
-    const u64 presubmit_tick = CurrentTick();
-    SubmitInfo info{};
-    SubmitExecution(info);
-    Wait(presubmit_tick);
-}
+void VKScheduler::SubmitExecution(VkSemaphore semaphore) {
+    EndPendingOperations();
+    InvalidateState();
+    WaitWorker();
 
-void Scheduler::Wait(u64 tick) {
-    if (tick >= master_semaphore.CurrentTick()) {
-        // Make sure we are not waiting for the current tick without signalling
-        SubmitInfo info{};
-        Flush(info);
-    }
-    master_semaphore.Wait(tick);
-}
+    std::unique_lock lock{mutex};
 
-void Scheduler::AllocateWorkerCommandBuffers() {
-    const vk::CommandBufferBeginInfo begin_info = {
-        .flags = vk::CommandBufferUsageFlagBits::eOneTimeSubmit,
+    current_cmdbuf.End();
+
+    const VkSemaphore timeline_semaphore = master_semaphore->Handle();
+    const u32 num_signal_semaphores = semaphore ? 2U : 1U;
+
+    const u64 signal_value = master_semaphore->CurrentTick();
+    const u64 wait_value = signal_value - 1;
+    const VkPipelineStageFlags wait_stage_mask = VK_PIPELINE_STAGE_ALL_COMMANDS_BIT;
+
+    master_semaphore->NextTick();
+
+    const std::array signal_values{signal_value, u64(0)};
+    const std::array signal_semaphores{timeline_semaphore, semaphore};
+
+    const VkTimelineSemaphoreSubmitInfoKHR timeline_si{
+        .sType = VK_STRUCTURE_TYPE_TIMELINE_SEMAPHORE_SUBMIT_INFO_KHR,
+        .pNext = nullptr,
+        .waitSemaphoreValueCount = 1,
+        .pWaitSemaphoreValues = &wait_value,
+        .signalSemaphoreValueCount = num_signal_semaphores,
+        .pSignalSemaphoreValues = signal_values.data(),
     };
-
-    current_cmdbuf = command_pool.Commit();
-    auto begin_result = current_cmdbuf.begin(begin_info);
-    ASSERT_MSG(begin_result == vk::Result::eSuccess, "Failed to begin command buffer: {}",
-               vk::to_string(begin_result));
-
-#if TRACY_GPU_ENABLED
-    auto* profiler_ctx = instance.GetProfilerContext();
-    if (profiler_ctx) {
-        static const auto scope_loc =
-            GPU_SCOPE_LOCATION("Guest Frame", MarkersPalette::GpuMarkerColor);
-        new (profiler_scope) tracy::VkCtxScope{profiler_ctx, &scope_loc, current_cmdbuf, true};
-    }
-#endif
-}
-
-void Scheduler::SubmitExecution(SubmitInfo& info) {
-    std::scoped_lock lk{submit_mutex};
-    const u64 signal_value = master_semaphore.NextTick();
-
-#if TRACY_GPU_ENABLED
-    auto* profiler_ctx = instance.GetProfilerContext();
-    if (profiler_ctx) {
-        profiler_scope->~VkCtxScope();
-        TracyVkCollect(profiler_ctx, current_cmdbuf);
-    }
-#endif
-
-    EndRendering();
-    auto end_result = current_cmdbuf.end();
-    ASSERT_MSG(end_result == vk::Result::eSuccess, "Failed to end command buffer: {}",
-               vk::to_string(end_result));
-
-    const vk::Semaphore timeline = master_semaphore.Handle();
-    info.AddSignal(timeline, signal_value);
-
-    static constexpr std::array<vk::PipelineStageFlags, 2> wait_stage_masks = {
-        vk::PipelineStageFlagBits::eAllCommands,
-        vk::PipelineStageFlagBits::eColorAttachmentOutput,
-    };
-
-    const vk::TimelineSemaphoreSubmitInfo timeline_si = {
-        .waitSemaphoreValueCount = static_cast<u32>(info.wait_ticks.size()),
-        .pWaitSemaphoreValues = info.wait_ticks.data(),
-        .signalSemaphoreValueCount = static_cast<u32>(info.signal_ticks.size()),
-        .pSignalSemaphoreValues = info.signal_ticks.data(),
-    };
-
-    const vk::SubmitInfo submit_info = {
+    const VkSubmitInfo submit_info{
+        .sType = VK_STRUCTURE_TYPE_SUBMIT_INFO,
         .pNext = &timeline_si,
-        .waitSemaphoreCount = static_cast<u32>(info.wait_semas.size()),
-        .pWaitSemaphores = info.wait_semas.data(),
-        .pWaitDstStageMask = wait_stage_masks.data(),
-        .commandBufferCount = 1U,
-        .pCommandBuffers = &current_cmdbuf,
-        .signalSemaphoreCount = static_cast<u32>(info.signal_semas.size()),
-        .pSignalSemaphores = info.signal_semas.data(),
+        .waitSemaphoreCount = 1,
+        .pWaitSemaphores = &timeline_semaphore,
+        .pWaitDstStageMask = &wait_stage_mask,
+        .commandBufferCount = 1,
+        .pCommandBuffers = current_cmdbuf.address(),
+        .signalSemaphoreCount = num_signal_semaphores,
+        .pSignalSemaphores = signal_semaphores.data(),
     };
-
-    ImGui::Core::TextureManager::Submit();
-    auto submit_result = instance.GetGraphicsQueue().submit(submit_info, info.fence);
-    ASSERT_MSG(submit_result != vk::Result::eErrorDeviceLost, "Device lost during submit");
-
-    master_semaphore.Refresh();
-    AllocateWorkerCommandBuffers();
-
-    // Apply pending operations
-    while (!pending_ops.empty() && IsFree(pending_ops.front().gpu_tick)) {
-        pending_ops.front().callback();
-        pending_ops.pop();
+    switch (const VkResult result = device.GetGraphicsQueue().Submit(submit_info)) {
+    case VK_SUCCESS:
+        break;
+    case VK_ERROR_DEVICE_LOST:
+        device.ReportLoss();
+        [[fallthrough]];
+    default:
+        vk::Check(result);
     }
+}
+
+void VKScheduler::AllocateNewContext() {
+    std::unique_lock lock{mutex};
+
+    current_cmdbuf = vk::CommandBuffer(command_pool->Commit(), device.GetDispatchLoader());
+    current_cmdbuf.Begin({
+        .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO,
+        .pNext = nullptr,
+        .flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT,
+        .pInheritanceInfo = nullptr,
+    });
+
+    // Enable counters once again. These are disabled when a command buffer is finished.
+    if (query_cache) {
+        query_cache->UpdateCounters();
+    }
+}
+
+void VKScheduler::InvalidateState() {
+    state.graphics_pipeline = nullptr;
+    state_tracker.InvalidateCommandBufferState();
+}
+
+void VKScheduler::EndPendingOperations() {
+    query_cache->DisableStreams();
+    EndRenderPass();
+}
+
+void VKScheduler::EndRenderPass() {
+    if (!state.renderpass) {
+        return;
+    }
+    state.renderpass = nullptr;
+    Record([](vk::CommandBuffer cmdbuf) { cmdbuf.EndRenderPass(); });
+}
+
+void VKScheduler::AcquireNewChunk() {
+    if (chunk_reserve.Empty()) {
+        chunk = std::make_unique<CommandChunk>();
+        return;
+    }
+    chunk = std::move(chunk_reserve.Front());
+    chunk_reserve.Pop();
 }
 
 } // namespace Vulkan
