@@ -1,22 +1,12 @@
-// Copyright 2019 yuzu Emulator Project
-// Licensed under GPLv2 or any later version
-// Refer to the license.txt file included.
+// SPDX-FileCopyrightText: Copyright 2019 yuzu Emulator Project
+// SPDX-License-Identifier: GPL-2.0-or-later
 
-#include <memory>
 #include <mutex>
-#include <optional>
-#include <thread>
-#include <utility>
-
-#include "common/microprofile.h"
-#include "common/thread.h"
-#include "video_core/renderer_vulkan/vk_command_pool.h"
-#include "video_core/renderer_vulkan/vk_device.h"
-#include "video_core/renderer_vulkan/vk_master_semaphore.h"
-#include "video_core/renderer_vulkan/vk_query_cache.h"
+#include "common/assert.h"
+#include "common/debug.h"
+#include "imgui/renderer/texture_manager.h"
+#include "video_core/renderer_vulkan/vk_instance.h"
 #include "video_core/renderer_vulkan/vk_scheduler.h"
-#include "video_core/renderer_vulkan/vk_state_tracker.h"
-#include "video_core/renderer_vulkan/wrapper.h"
 
 namespace Vulkan {
 
