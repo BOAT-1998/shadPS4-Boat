@@ -3,6 +3,8 @@
 
 #include "input_handler.h"
 
+#include <algorithm>
+#include <cctype>
 #include <fstream>
 #include <iostream>
 #include <list>
@@ -27,6 +29,13 @@
 #include "input/input_mouse.h"
 
 namespace Input {
+namespace {
+void TrimString(std::string& str) {
+    const auto not_space = [](unsigned char c) { return !std::isspace(c); };
+    str.erase(str.begin(), std::find_if(str.begin(), str.end(), not_space));
+    str.erase(std::find_if(str.rbegin(), str.rend(), not_space).base(), str.end());
+}
+} // namespace
 /*
 Project structure:
 n to m connection between inputs and outputs
@@ -171,7 +180,8 @@ InputBinding GetBindingFromString(std::string& line) {
 
     // Check and process tokens
     for (const auto token : std::views::split(line, ',')) { // Split by comma
-        const std::string t(token.begin(), token.end());
+        std::string t(token.begin(), token.end());
+        TrimString(t);
         InputID input;
 
         if (string_to_keyboard_key_map.find(t) != string_to_keyboard_key_map.end()) {
@@ -220,18 +230,11 @@ void ParseInputConfig(const std::string game_id = "") {
     int lineCount = 0;
 
     std::ifstream file(config_file);
-    std::string line = "";
-    while (std::getline(file, line)) {
+    std::string raw_line = "";
+    while (std::getline(file, raw_line)) {
         lineCount++;
+        std::string line = raw_line;
 
-        // Strip the ; and whitespace
-        line.erase(std::remove_if(line.begin(), line.end(),
-                                  [](unsigned char c) { return std::isspace(c); }),
-                   line.end());
-
-        if (line.empty()) {
-            continue;
-        }
         // Truncate lines starting at #
         std::size_t comment_pos = line.find('#');
         if (comment_pos != std::string::npos) {
@@ -241,6 +244,9 @@ void ParseInputConfig(const std::string game_id = "") {
         if (!line.empty() && line[line.length() - 1] == ';') {
             line = line.substr(0, line.length() - 1);
         }
+
+        TrimString(line);
+
         if (line.empty()) {
             continue;
         }
@@ -249,12 +255,20 @@ void ParseInputConfig(const std::string game_id = "") {
         std::size_t equal_pos = line.find('=');
         if (equal_pos == std::string::npos) {
             LOG_WARNING(Input, "Invalid format at line: {}, data: \"{}\", skipping line.",
-                        lineCount, line);
+                        lineCount, raw_line);
             continue;
         }
 
         std::string output_string = line.substr(0, equal_pos);
         std::string input_string = line.substr(equal_pos + 1);
+        TrimString(output_string);
+        TrimString(input_string);
+
+        if (output_string.empty() || input_string.empty()) {
+            LOG_WARNING(Input, "Invalid format at line: {}, data: \"{}\", skipping line.",
+                        lineCount, raw_line);
+            continue;
+        }
         std::size_t comma_pos = input_string.find(',');
 
         auto parseInt = [](const std::string& s) -> std::optional<int> {
@@ -318,6 +332,10 @@ void ParseInputConfig(const std::string game_id = "") {
                 continue;
             }
 
+            TrimString(device);
+            TrimString(inner_deadzone_str);
+            TrimString(outer_deadzone_str);
+
             auto inner_deadzone = parseInt(inner_deadzone_str);
             auto outer_deadzone = parseInt(outer_deadzone_str);
 
@@ -354,6 +372,10 @@ void ParseInputConfig(const std::string game_id = "") {
                             lineCount, line);
                 continue;
             }
+            TrimString(enable);
+            TrimString(r_s);
+            TrimString(g_s);
+            TrimString(b_s);
             r = parseInt(r_s);
             g = parseInt(g_s);
             b = parseInt(b_s);
