@@ -3,9 +3,14 @@
 
 #pragma once
 
+#include <chrono>
+
 #include <filesystem>
 #include <optional>
+#include <string>
+#include <string_view>
 #include <thread>
+#include <vector>
 
 #include "common/singleton.h"
 #include "core/linker.h"
