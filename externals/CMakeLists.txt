@@ -8,6 +8,21 @@ set_directory_properties(PROPERTIES
     SYSTEM ON
 )
 
+# Ensure that required external dependencies are present before attempting to
+# include them. When the repository is cloned without fetching submodules, the
+# directories exist but are empty, which results in confusing CMake errors about
+# missing `CMakeLists.txt` files. Performing an explicit check provides a much
+# clearer message and helps developers quickly diagnose the problem.
+function(require_external_dependency dir pretty_name)
+    if (NOT EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/${dir}/CMakeLists.txt")
+        message(FATAL_ERROR
+            "External dependency '${pretty_name}' is missing. "
+            "Expected '${dir}/CMakeLists.txt'. "
+            "Run `git submodule update --init --recursive` to fetch the "
+            "project's submodules.")
+    endif()
+endfunction()
+
 # Set CMP0069 policy to "NEW" in order to ensure consistent behavior when building external targets with LTO enabled
 set(CMAKE_POLICY_DEFAULT_CMP0069 NEW)
 
@@ -18,16 +33,19 @@ endif()
 
 # Boost
 if (NOT TARGET Boost::headers)
+    require_external_dependency("ext-boost" "Boost")
     add_subdirectory(ext-boost)
 endif()
 
 # fmtlib
 if (NOT TARGET fmt::fmt)
+    require_external_dependency("fmt" "fmt")
     add_subdirectory(fmt)
 endif()
 
 # FFmpeg
 if (NOT TARGET FFmpeg::ffmpeg)
+    require_external_dependency("ffmpeg-core" "FFmpeg")
     add_subdirectory(ffmpeg-core)
     add_library(FFmpeg::ffmpeg ALIAS ffmpeg)
 endif()
@@ -60,17 +78,20 @@ endif()
 if (NOT TARGET SDL3::SDL3)
     set(SDL_TEST_LIBRARY OFF)
     set(SDL_PIPEWIRE OFF)
+    require_external_dependency("sdl3" "SDL3")
     add_subdirectory(sdl3)
 endif()
 
 # vulkan-headers
 if (NOT TARGET Vulkan::Headers)
     set(VULKAN_HEADERS_ENABLE_MODULE OFF)
+    require_external_dependency("vulkan-headers" "VulkanHeaders")
     add_subdirectory(vulkan-headers)
 endif()
 
 # VMA
 if (NOT TARGET GPUOpen::VulkanMemoryAllocator)
+    require_external_dependency("vma" "VulkanMemoryAllocator")
     add_subdirectory(vma)
 endif()
 
@@ -90,6 +111,7 @@ if (NOT TARGET glslang::glslang)
     set(ENABLE_HLSL OFF CACHE BOOL "")
     set(BUILD_EXTERNAL OFF CACHE BOOL "")
     set(ENABLE_OPT OFF CACHE BOOL "")
+    require_external_dependency("glslang" "glslang")
     add_subdirectory(glslang)
     file(COPY glslang/SPIRV DESTINATION glslang/glslang FILES_MATCHING PATTERN "*.h")
     target_include_directories(glslang INTERFACE "${CMAKE_CURRENT_BINARY_DIR}/glslang")
@@ -97,21 +119,25 @@ endif()
 
 # Robin-map
 if (NOT TARGET tsl::robin_map)
+    require_external_dependency("robin-map" "tsl::robin_map")
     add_subdirectory(robin-map)
 endif()
 
 # Xbyak
 if (NOT TARGET xbyak::xbyak)
+    require_external_dependency("xbyak" "xbyak")
     add_subdirectory(xbyak)
 endif()
 
 # MagicEnum
 if (NOT TARGET magic_enum::magic_enum)
+    require_external_dependency("magic_enum" "magic_enum")
     add_subdirectory(magic_enum)
 endif()
 
 # Toml11
 if (NOT TARGET toml11::toml11)
+    require_external_dependency("toml11" "toml11")
     add_subdirectory(toml11)
 
     if (CMAKE_CXX_COMPILER_ID STREQUAL "Clang")
@@ -134,10 +160,12 @@ endif()
 if (NOT TARGET Zydis::Zydis)
     option(ZYDIS_BUILD_TOOLS "" OFF)
     option(ZYDIS_BUILD_EXAMPLES "" OFF)
+    require_external_dependency("zydis" "Zydis")
     add_subdirectory(zydis)
 endif()
 
 # sirit
+require_external_dependency("sirit" "sirit")
 add_subdirectory(sirit)
 if (WIN32)
     target_compile_options(sirit PUBLIC "-Wno-error=unused-command-line-argument")
@@ -188,25 +216,30 @@ option(TRACY_NO_CODE_TRANSFER "" ON)
 option(TRACY_NO_SAMPLING "" ON)
 option(TRACY_ONLY_LOCALHOST "" ON)
 option(TRACY_NO_CONTEXT_SWITCH "" ON)
+require_external_dependency("tracy" "Tracy")
 add_subdirectory(tracy)
 
 # pugixml
 if (NOT TARGET pugixml::pugixml)
+    require_external_dependency("pugixml" "pugixml")
     add_subdirectory(pugixml)
 endif()
 
 # libusb
 if (NOT TARGET libusb::usb)
+    require_external_dependency("ext-libusb" "libusb")
     add_subdirectory(ext-libusb)
     add_library(libusb::usb ALIAS usb-1.0)
 endif()
 
 # Discord RPC
 if (ENABLE_DISCORD_RPC)
+    require_external_dependency("discord-rpc" "Discord RPC")
     add_subdirectory(discord-rpc)
 endif()
 
 # GCN Headers
+require_external_dependency("gcn" "GCN headers")
 add_subdirectory(gcn)
 
 # stb
@@ -218,6 +251,7 @@ endif()
 
 # hwinfo
 set(HWINFO_STATIC ON)
+require_external_dependency("hwinfo" "hwinfo")
 add_subdirectory(hwinfo)
 
 # Apple-only dependencies
@@ -226,6 +260,7 @@ if (APPLE)
     if (NOT TARGET date::date-tz)
         option(BUILD_TZ_LIB "" ON)
         option(USE_SYSTEM_TZ_DB "" ON)
+        require_external_dependency("date" "date")
         add_subdirectory(date)
     endif()
 
@@ -233,19 +268,23 @@ if (APPLE)
     if (NOT TARGET MoltenVK)
         set(MVK_EXCLUDE_SPIRV_TOOLS ON)
         set(MVK_USE_METAL_PRIVATE_API ON)
+        require_external_dependency("MoltenVK" "MoltenVK")
         add_subdirectory(MoltenVK)
     endif()
 
     if (NOT TARGET epoll-shim)
+        require_external_dependency("epoll-shim" "epoll-shim")
         add_subdirectory(epoll-shim)
     endif()
 endif()
 
 #windows only
 if (WIN32)
-add_subdirectory(ext-wepoll)
+    require_external_dependency("ext-wepoll" "wepoll")
+    add_subdirectory(ext-wepoll)
 endif()
 
-#nlohmann json 
+#nlohmann json
 set(JSON_BuildTests OFF CACHE INTERNAL "")
+require_external_dependency("json" "nlohmann_json")
 add_subdirectory(json)
